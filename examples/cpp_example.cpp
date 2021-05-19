@@ -18,9 +18,11 @@
 #include "reconstruction.h"
 #include "feature_utils.h"
 #include "utils.h"
+#include "matcher.h"
 #include "pose_graph.h"
 #include "visibility_table.h"
 #include "graph_traversal.h"
+#include "point_track.h"
 
 #include <ctime>
 #include <sys/types.h>
@@ -39,6 +41,8 @@ DEFINE_bool(use_gpu, true,
 	"A flag determining if GPU should be used where possible.");
 DEFINE_bool(use_path_finding, true,
 	"A flag determining if path finding should be used.");
+DEFINE_bool(use_epipolar_hashing, true,
+	"A flag determining if epipolar hashing should be used.");
 DEFINE_string(workspace_path, "d:/Kutatas/PoseGraphRANSAC/git/data/Madrid_Metropolis/images/",
 	"The path where everything will be saved.");
 DEFINE_string(image_path, "d:/Kutatas/PoseGraphRANSAC/git/data/Madrid_Metropolis/images/",
@@ -54,12 +58,18 @@ DEFINE_double(inlier_outlier_threshold, 0.4,
 	"The inlier-outlier threshold for essential matrix fitting.");
 DEFINE_int32(minimum_inlier_number, 20,
 	"The minimum number of inliers for a pose to be accepted.");
+DEFINE_int32(minimum_point_number, 50,
+	"The minimum number of points for the robust estimation.");
 DEFINE_double(traversal_heuristics_weight, 0.8,
 	"The weighting parameter in the heuristics for the A* traversal.");
 DEFINE_int32(maximum_path_number, 100,
 	"An upper bound for the number of paths to be tested.");
 DEFINE_int32(maximum_search_depth, 5,
 	"An upper bound for the search depth.");
+DEFINE_int32(maximum_tracklet_number, 5000,
+	"The maximum number of tracklets used for the robust estimation.");
+DEFINE_int32(maximum_points_from_epipolar_hashing, 100,
+	"The maximum number of points accepted when doing epipolar hashing");
 
 bool checkSetting();
 
@@ -116,6 +126,30 @@ void createCorrespondenceMatrix(
 	cv::Mat& correspondences_,
 	double& normalizedThreshold_);
 
+void loadImageData(
+	const size_t& kImageNumber_,
+	const std::string& kImageDatabaseFilename_,
+	std::shared_mutex& lock_,
+	std::vector<std::tuple<std::string, double, double, double>>& imageData_);
+
+void initializeReconstruction(
+	const size_t& kImageNumber_, // The number of images to be added to the reconstruction
+	const std::vector<std::tuple<std::string, double, double, double>>& imageData_, // The image data
+	reconstruction::Reconstruction& reconstruction_, // The reconstruction to be built
+	reconstruction::PoseGraph& poseGraph_); // The pose graph
+
+void guidedMatching(
+	const reconstruction::Reconstruction& kReconstruction_,
+	const reconstruction::ViewId& kSourceViewIdx_,
+	const reconstruction::ViewId& kDestinationViewIdx_,
+	const cv::Mat& kSourceDescriptors_,
+	const cv::Mat& kDestinationDescriptors_,
+	const std::vector<cv::KeyPoint>& kSourceKeypoints_,
+	const std::vector<cv::KeyPoint>& kDestinationKeypoints_,
+	const reconstruction::Pose& kPose_,
+	const double& kInlierOutlierThreshold_,
+	std::vector<std::tuple<size_t, size_t, double>>& matches_);
+
 int main(int argc, char** argv)
 {
 	// Parsing the flags
@@ -132,96 +166,51 @@ int main(int argc, char** argv)
 		FLAGS_focal_length_path << "'";
 	
 	// If database already available
-	std::shared_mutex lock_;
+	std::shared_mutex lock;
 	const std::string kImageDatabaseFilename = FLAGS_workspace_path + "image_data.h5";
 	const std::string kKeypointDatabaseFilename = FLAGS_workspace_path + "keypoints.h5";
 	const std::string kCorrespondenceDatabaseFilename = FLAGS_workspace_path + "correspondences.h5";
 
+	// Check if the database file that contains the image sizes and focal
+	// lengths exists.
 	std::ifstream file(kImageDatabaseFilename);
 	const bool kDatabaseExists = file.is_open();
 	if (kDatabaseExists)
 		file.close();
 
-	cv::Ptr<cv::hdf::HDF5> h5ImageDatabase = cv::hdf::open(kImageDatabaseFilename);
+	// The vector containing the focal lengths and images sizes
 	std::vector<std::tuple<std::string, double, double, double>> imageData;
+	// The total number of images
 	size_t totalImageNumber = 0;
 
+	// Loading the image list and focal length
 	load1DSfMImageList(
-		FLAGS_image_path,
-		FLAGS_focal_length_path,
-		FLAGS_core_number,
-		!kDatabaseExists,
-		totalImageNumber,
-		imageData);
+		FLAGS_image_path, // The path where the images are stored
+		FLAGS_focal_length_path, // The path where the focal lengths are stored
+		FLAGS_core_number, // The number of CPU cores to be used
+		!kDatabaseExists, // A flag to decide if the images should be load one-by-one to get their sizes
+		totalImageNumber, // The total number of images
+		imageData); // The vector containing the focal lengths and images sizes
 
 	// The number of images with focal length
 	const size_t kImageNumber = imageData.size();
 
-#pragma omp parallel for num_threads(FLAGS_core_number)
-	for (int imageIdx = 0; imageIdx < kImageNumber; ++imageIdx)
-	{
-		// The properties, like focal length, of the current image
-		const auto& kData = imageData[imageIdx];
-		// The focal length of the current image
-		const auto& kFocalLength = std::get<1>(kData);
-		const auto& kImageName = std::get<0>(kData);
-		cv::Mat tmpImageData(1, 3, CV_64F);
-
-		if (!h5ImageDatabase->hlexists(kImageName))
-		{
-			tmpImageData.at<double>(0) = std::get<1>(kData);
-			tmpImageData.at<double>(1) = std::get<2>(kData);
-			tmpImageData.at<double>(2) = std::get<3>(kData);
-
-			std::unique_lock<std::shared_mutex> lock(lock_);
-			h5ImageDatabase->dscreate(1, 3, CV_64F, kImageName);
-			h5ImageDatabase->dswrite(tmpImageData, kImageName);			
-			lock.unlock();
-		}
-		else
-		{
-			std::shared_lock<std::shared_mutex> lock(lock_);
-			h5ImageDatabase->dsread(tmpImageData, kImageName);
-			lock.unlock();
-		}
-	}
-	h5ImageDatabase->close();
+	// Loading or saving the image sizes
+	loadImageData(kImageNumber, // The number of images with focal length
+		kImageDatabaseFilename, // The image database file's path 
+		lock, // The mutex making the procedure thread-safe
+		imageData); // The image data to be loaded
 
 	// Initialize the reconstruction
 	reconstruction::Reconstruction reconstruction;
 	reconstruction::PoseGraph poseGraph;
 
-	for (int imageIdx = 0; imageIdx < kImageNumber; ++imageIdx)
-	{
-		if (!reconstruction.addCamera(imageIdx)) {
-			LOG(INFO) << "A problem occured when adding camera '" << imageIdx
-				<< "' to the reconstruction.";
-			continue;
-		}
-		else if (!reconstruction.addView(imageIdx, imageIdx)) {
-			LOG(INFO) << "A problem occured when adding view '" << imageIdx
-				<< "' to the reconstruction.";
-			continue;
-		}
-
-		const auto& kData = imageData[imageIdx];
-		const auto& kImageName = std::get<0>(kData);
-		const auto& kFocalLength = std::get<1>(kData);
-		const auto& kImageWidth = std::get<2>(kData);
-		const auto& kImageHeight = std::get<3>(kData);
-
-		reconstruction::View& view = reconstruction.getMutableView(imageIdx);
-		reconstruction::ViewMetadata& metadata = view.getMutableMetadata();
-		metadata["name"] =
-			kImageName.substr(0, kImageName.size() - 4); // Cut the extension
-		metadata["extension"] =
-			kImageName.substr(kImageName.size() - 3, kImageName.size()); // Get the extension of the image
-
-		reconstruction.getMutableCamera(imageIdx).setWidth(kImageWidth);
-		reconstruction.getMutableCamera(imageIdx).setHeight(kImageHeight);
-		reconstruction.getMutableCamera(imageIdx).setIntrinsics(kFocalLength, kFocalLength, kImageWidth / 2.0, kImageHeight / 2.0);
-		poseGraph.addVertex(imageIdx);
-	}
+	// Initializing the reconstruction and the pose graph
+	initializeReconstruction(
+		kImageNumber, // The number of images to be added to the reconstruction
+		imageData, // The image data
+		reconstruction, // The reconstruction to be built
+		poseGraph); // The pose graph
 
 	// Loading the image similarity matrix
 	reconstruction::SimilarityTable similarityTable(
@@ -241,6 +230,91 @@ int main(int argc, char** argv)
 		kCorrespondenceDatabaseFilename);
 
 	return 0;
+}
+
+void initializeReconstruction(
+	const size_t &kImageNumber_, // The number of images to be added to the reconstruction
+	const std::vector<std::tuple<std::string, double, double, double>>& imageData_, // The image data
+	reconstruction::Reconstruction &reconstruction_, // The reconstruction to be built
+	reconstruction::PoseGraph &poseGraph_) // The pose graph
+{
+	for (int imageIdx = 0; imageIdx < kImageNumber_; ++imageIdx)
+	{
+		if (!reconstruction_.addCamera(imageIdx)) {
+			LOG(INFO) << "A problem occured when adding camera '" << imageIdx
+				<< "' to the reconstruction.";
+			continue;
+		}
+		else if (!reconstruction_.addView(imageIdx, imageIdx)) {
+			LOG(INFO) << "A problem occured when adding view '" << imageIdx
+				<< "' to the reconstruction.";
+			continue;
+		}
+
+		const auto& kData = imageData_[imageIdx];
+		const auto& kImageName = std::get<0>(kData);
+		const auto& kFocalLength = std::get<1>(kData);
+		const auto& kImageWidth = std::get<2>(kData);
+		const auto& kImageHeight = std::get<3>(kData);
+
+		reconstruction::View& view = reconstruction_.getMutableView(imageIdx);
+		reconstruction::ViewMetadata& metadata = view.getMutableMetadata();
+		metadata["name"] =
+			kImageName.substr(0, kImageName.size() - 4); // Cut the extension
+		metadata["extension"] =
+			kImageName.substr(kImageName.size() - 3, kImageName.size()); // Get the extension of the image
+
+		reconstruction_.getMutableCamera(imageIdx).setWidth(kImageWidth);
+		reconstruction_.getMutableCamera(imageIdx).setHeight(kImageHeight);
+		reconstruction_.getMutableCamera(imageIdx).setIntrinsics(kFocalLength, kFocalLength, kImageWidth / 2.0, kImageHeight / 2.0);
+		poseGraph_.addVertex(imageIdx);
+	}
+}
+
+void loadImageData(
+	const size_t &kImageNumber_,
+	const std::string &kImageDatabaseFilename_,
+	std::shared_mutex &lock_,
+	std::vector<std::tuple<std::string, double, double, double>> &imageData_)
+{
+	// Opening or creating the database file that contains the image sizes and focal lengths.
+	cv::Ptr<cv::hdf::HDF5> h5ImageDatabase = cv::hdf::open(kImageDatabaseFilename_);
+
+#pragma omp parallel for num_threads(FLAGS_core_number)
+	for (int imageIdx = 0; imageIdx < kImageNumber_; ++imageIdx)
+	{
+		// The properties, like focal length, of the current image
+		auto& kData = imageData_[imageIdx];
+		// The focal length of the current image
+		const auto& kFocalLength = std::get<1>(kData);
+		const auto& kImageName = std::get<0>(kData);
+		cv::Mat tmpImageData(1, 3, CV_64F);
+
+		if (!h5ImageDatabase->hlexists(kImageName))
+		{
+			tmpImageData.at<double>(0) = std::get<1>(kData);
+			tmpImageData.at<double>(1) = std::get<2>(kData);
+			tmpImageData.at<double>(2) = std::get<3>(kData);
+
+			std::unique_lock<std::shared_mutex> lock(lock_);
+			h5ImageDatabase->dscreate(1, 3, CV_64F, kImageName);
+			h5ImageDatabase->dswrite(tmpImageData, kImageName);
+			lock.unlock();
+		}
+		else
+		{
+			auto& width = std::get<2>(kData);
+			auto& height = std::get<3>(kData);
+
+			std::shared_lock<std::shared_mutex> lock(lock_);
+			h5ImageDatabase->dsread(tmpImageData, kImageName);
+			lock.unlock();
+
+			width = tmpImageData.at<double>(1);
+			height = tmpImageData.at<double>(2);
+		}
+	}
+	h5ImageDatabase->close();
 }
 
 void processImages(
@@ -277,6 +351,9 @@ void processImages(
 	size_t processedImages = 0;
 	const size_t kTotalPairNumber = viewPairs.size();
 	RunningStatistics statistics;
+
+	// Initialize the point tracks
+	reconstruction::Tracklets tracks(kTotalPairNumber);
 
 	// Iterating through the image pairs which has high similarity score
 #pragma omp parallel for num_threads(FLAGS_core_number)
@@ -374,32 +451,71 @@ void processImages(
 				featureDatabaseMutex); // A mutex to make the database writing/reading thread-safe
 			h5FeatureDatabase->close();
 
-			// Loading or detecting point correspondences
-			// TODO(danini): Add epipolar hashing
-			cv::Ptr<cv::hdf::HDF5> h5CorrespondenceDatabase = cv::hdf::open(kCorrespondenceDatabaseFilename_);
+			// The feature matches
 			std::vector<std::tuple<size_t, size_t, double>> matches;
-			start = std::chrono::system_clock::now();
-			matchFeatures(
-				kSourceImageName, // The name of the source image
-				kDestinationImageName, // The name of the destination image
-				keypoints_1, // The found keypoints in the source image
-				keypoints_2, // The found keypoints in the destination image
-				descriptors_1, // The descriptors of the found keypoints in the source image
-				descriptors_2, // The descriptors of the found keypoints in the destination image
-				FLAGS_use_gpu, // A flag to decide if GPU should be used
-				h5CorrespondenceDatabase, // The correspondence database file
-				matches, // The found matches
-				correspondenceDatabaseMutex);  // A mutex to make the database writing/reading thread-safe
-			end = std::chrono::system_clock::now();
-			h5CorrespondenceDatabase->close();
 
-			// Updating the statistics
-			elapsedSeconds = end - start;
-			statistics.addTime("matching", elapsedSeconds.count());
-			statistics.addCount("matching", 1);
+			// A flag to decide if matching on demand is turned on
+			bool quickMatching = FLAGS_use_epipolar_hashing;
+
+			if (FLAGS_use_epipolar_hashing)
+			{
+				start = std::chrono::system_clock::now();
+				if (kAreViewsVisible)
+					tracks.getCorrespondences(
+						matches, // The indices of keypoints which compose the correspondences
+						kSourceViewIdx, // The identifier of the source image
+						kDestinationViewIdx, // The identifier of the destination image
+						FLAGS_maximum_tracklet_number); // The maximum number of tracklets which are to be used
+				end = std::chrono::system_clock::now();
+
+				// Updating the statistics
+				elapsedSeconds = end - start;
+				statistics.addTime("[Quick matching]", elapsedSeconds.count());
+
+				// If there are not enough correspondences from the tracklets
+				if (matches.size() < FLAGS_minimum_inlier_number)
+				{
+					// Turn off epipolar-hashing-based quick matching
+					quickMatching = false;
+					// Clearing the matches
+					matches.clear();
+				}
+				else
+				{
+					// Updating the statistics
+					statistics.addCount("[Quick matching] Runs", 1);
+				}
+			} 
+
+			if (!quickMatching)
+			{
+				// Loading or detecting point correspondences
+				// TODO(danini): Add epipolar hashing
+				cv::Ptr<cv::hdf::HDF5> h5CorrespondenceDatabase = cv::hdf::open(kCorrespondenceDatabaseFilename_);
+
+				start = std::chrono::system_clock::now();
+				matchFeatures(
+					kSourceImageName, // The name of the source image
+					kDestinationImageName, // The name of the destination image
+					keypoints_1, // The found keypoints in the source image
+					keypoints_2, // The found keypoints in the destination image
+					descriptors_1, // The descriptors of the found keypoints in the source image
+					descriptors_2, // The descriptors of the found keypoints in the destination image
+					FLAGS_use_gpu, // A flag to decide if GPU should be used
+					h5CorrespondenceDatabase, // The correspondence database file
+					matches, // The found matches
+					correspondenceDatabaseMutex);  // A mutex to make the database writing/reading thread-safe
+				end = std::chrono::system_clock::now();
+				h5CorrespondenceDatabase->close();
+
+				// Updating the statistics
+				elapsedSeconds = end - start;
+				statistics.addTime("[Matching]", elapsedSeconds.count());
+				statistics.addCount("[Matching] Runs", 1);
+			}
 
 			// Continue if there are not enough correspondences found
-			if (matches.size() < FLAGS_minimum_inlier_number)
+			if (matches.size() < FLAGS_minimum_point_number)
 				continue;
 
 			// Create the correspondence matrix
@@ -505,6 +621,39 @@ void processImages(
 					reconstruction::Pose(estimatedPose), 
 					kInlierRatio)); // The edge with the estimated pose
 
+			// Finding additional correspondences by epipolar hashing
+			if (FLAGS_use_epipolar_hashing && // If epipolar hashing is requires
+				quickMatching) // and quick matching was applied.
+			{
+				std::vector<std::tuple<size_t, size_t, double>> additionalMatches;
+
+				// The end time of epipolar hashing
+				start = std::chrono::system_clock::now();
+				guidedMatching(reconstruction_,
+					kSourceViewIdx,
+					kDestinationViewIdx,
+					descriptors_1,
+					descriptors_2,
+					keypoints_1,
+					keypoints_2,
+					estimatedPose,
+					normalizedThreshold,
+					additionalMatches);
+
+				std::vector<uchar> additionalInlierMask(additionalMatches.size(), 1);
+
+				tracks.add(kSourceViewIdx,
+					kDestinationViewIdx,
+					additionalMatches,
+					additionalInlierMask);
+				// The end time of epipolar hashing
+				end = std::chrono::system_clock::now();
+
+				statistics.addTime("[Epipolar Hashing]", elapsedSeconds.count());
+				statistics.addCount("[Epipolar Hashing] Runs", 1);
+				statistics.addCount("[Epipolar Hashing] Correspondences added", additionalMatches.size());
+			}
+
 			// The starting time of updating the visibility pose graph
 			start = std::chrono::system_clock::now();
 			// Add a new link into the visibility structure
@@ -516,6 +665,14 @@ void processImages(
 			// Updating the statistics file
 			statistics.addTime("[Visibility update]", elapsedSeconds.count());
 			statistics.addCount("[Visibility update] Runs", 1);
+
+			// Update the tracklets
+			if (FLAGS_use_epipolar_hashing &&
+				!quickMatching)
+				tracks.add(kSourceViewIdx,
+					kDestinationViewIdx,
+					matches,
+					inlierMask);
 		}
 	}
 
@@ -523,6 +680,74 @@ void processImages(
 	statistics.print();
 
 	printf("Edges in the pose-graph = %d\n", poseGraph_.numEdges());
+}
+
+void guidedMatching(
+	const reconstruction::Reconstruction &kReconstruction_,
+	const reconstruction::ViewId& kSourceViewIdx_,
+	const reconstruction::ViewId& kDestinationViewIdx_,
+	const cv::Mat& kSourceDescriptors_,
+	const cv::Mat& kDestinationDescriptors_,
+	const std::vector<cv::KeyPoint> &kSourceKeypoints_,
+	const std::vector<cv::KeyPoint> &kDestinationKeypoints_,
+	const reconstruction::Pose &kPose_,
+	const double &kInlierOutlierThreshold_,
+	std::vector<std::tuple<size_t, size_t, double>> &matches_)
+{
+	// Getting the cameras
+	const reconstruction::PinholeCamera& kSourceCamera = kReconstruction_.getCamera(kSourceViewIdx_),
+		& kDestinationCamera = kReconstruction_.getCamera(kDestinationViewIdx_);
+
+	// Initializing the matcher
+	reconstruction::pointmatcher::PointMatcherWithPose* guidedMatcher;
+	static cv::Mat emptyImage(0, 0, CV_64F);
+
+	// The guided matcher object performing Epipolar Hashing
+	guidedMatcher = new reconstruction::pointmatcher::HashingBasedMatcherWithPose<false, 45>(
+		emptyImage, // An empty image. This parameter is for testing purposes.
+		emptyImage, // An empty image. This parameter is for testing purposes.
+		cv::Size(kSourceCamera.getWidth(), kSourceCamera.getHeight()), // The size of the source image
+		cv::Size(kDestinationCamera.getWidth(), kDestinationCamera.getHeight()), // The size of the destination image
+		kSourceDescriptors_, // The descriptors in the source image
+		kDestinationDescriptors_); // The descriptors in the destination image
+
+	std::vector<std::pair<size_t, size_t>> matches;
+	std::vector<double> descriptorDistances;
+
+	guidedMatcher->match(
+		matches,
+		kSourceKeypoints_,
+		kDestinationKeypoints_,
+		kPose_,
+		kInlierOutlierThreshold_,
+		descriptorDistances,
+		&kSourceCamera.getIntrinsics(),
+		&kDestinationCamera.getIntrinsics());
+
+	if (matches.size() > FLAGS_maximum_points_from_epipolar_hashing)
+	{
+		std::priority_queue<std::pair<double, size_t>, std::vector<std::pair<double, size_t>>, std::greater<std::pair<double, size_t>> > matchQueue;
+		for (size_t i = 0; i < matches.size(); ++i)
+			matchQueue.emplace(std::make_pair(descriptorDistances[i], i));
+
+		matches_.reserve(FLAGS_maximum_points_from_epipolar_hashing);
+		while (!matchQueue.empty() && matches_.size() < FLAGS_maximum_points_from_epipolar_hashing)
+		{
+			const auto& match = matches[matchQueue.top().second];
+			matches_.emplace_back(std::make_tuple(match.first, match.second, matchQueue.top().first));
+			matchQueue.pop();
+		}
+	}
+	else
+	{
+		matches_.reserve(matches.size());
+		for (size_t matchIdx = 0; matchIdx < matches.size(); ++matchIdx)
+		{
+			const auto& match = matches[matchIdx];
+			matches_.emplace_back(
+				std::make_tuple(match.first, match.second, descriptorDistances[0]));
+		}
+	}
 }
 
 bool findPath(

@@ -58,9 +58,11 @@ struct RunningStatistics
         printf("Statistics:\n");
         for (const auto& [key, value] : getTimes())
             printf("\tAverage '%s' time = %f seconds\n", key.c_str(), getAverageTime(key).first);
+        printf("\t------------------\n");
 
         for (const auto& [key, value] : getTimes())
             printf("\tTotal '%s' time = %f seconds\n", key.c_str(), value.first);
+        printf("\t------------------\n");
 
         for (const auto& [key, value] : getCounts())
             printf("\tNumber of '%s' = %d\n", key.c_str(), value.first);
