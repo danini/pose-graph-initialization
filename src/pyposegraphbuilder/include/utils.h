@@ -8,6 +8,9 @@
 #include <opencv2/highgui.hpp>
 #include <sys/stat.h>
 #include <mutex>
+#include <sstream>
+#include <fstream>
+#include <string>
 
 struct RunningStatistics
 {
@@ -65,7 +68,7 @@ struct RunningStatistics
         printf("\t------------------\n");
 
         for (const auto& [key, value] : getCounts())
-            printf("\tNumber of '%s' = %d\n", key.c_str(), value.first);
+            printf("\tNumber of '%s' = %d\n", key.c_str(), static_cast<int>(value.first));
     }
 };
 
@@ -168,7 +171,7 @@ inline void load1DSfMImageList(
     // Loading the images to get their sizes if needed
     if (kLoadImageSizes_)
 #pragma omp parallel for num_threads(kCoreNumber_)
-        for (int tupleIdx = 0; tupleIdx < results_.size(); ++tupleIdx)
+        for (int tupleIdx = 0; tupleIdx < static_cast<int>(results_.size()); ++tupleIdx)
         {
             auto& tuple = results_[tupleIdx];
             const auto& imageName = std::get<0>(tuple);

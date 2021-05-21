@@ -200,7 +200,7 @@ namespace reconstruction {
 			Eigen::Matrix<double, 3, 4> proj_2;
 			proj_2 << rotations[i], ((i % 2 ? -1 : 1) * translation);
 						
-			for (size_t point_idx = 0; point_idx < normalized_correspondences_.rows; ++point_idx) {
+			for (int point_idx = 0; point_idx < normalized_correspondences_.rows; ++point_idx) {
 
 				Eigen::Matrix<double, 4, 1> triangulated_point;
 				linearTriangulation(proj_1, proj_2, normalized_correspondences_.row(point_idx), triangulated_point);

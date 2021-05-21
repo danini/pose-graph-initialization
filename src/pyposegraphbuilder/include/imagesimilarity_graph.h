@@ -5,6 +5,8 @@
 #include "types.h"
 #include "pose.h"
 #include <filesystem>
+#include <unordered_set>
+#include <sstream>
 
 #define NO_SUCH_VERTEX -99999
 

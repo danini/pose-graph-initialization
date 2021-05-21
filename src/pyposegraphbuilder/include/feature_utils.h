@@ -9,7 +9,9 @@
 #include "opencv2/xfeatures2d/cuda.hpp"
 #include "opencv2/xfeatures2d.hpp"
 #include "opencv2/features2d.hpp"
+#include <opencv2/hdf.hpp>
 #include <iostream>
+#include <string>
 
 // Loading or detecting feature points in an image
 inline void loadFeatures(
